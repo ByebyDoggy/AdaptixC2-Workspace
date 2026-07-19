@@ -1,0 +1,6 @@
+[submodule "AdaptixC2"]
+	path = AdaptixC2
+	url = https://github.com/Adaptix-Framework/AdaptixC2.git
+[submodule "MCP-Server"]
+	path = MCP-Server
+	url = https://github.com/Faceless0x7/AdaptixC2-MCP-Server.git

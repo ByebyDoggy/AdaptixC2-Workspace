@@ -4,6 +4,10 @@ import time
 import ssl
 import json
 import fcntl
+import ast
+import difflib
+import re
+from typing import Any, Dict, List, Optional, Tuple, Union
 from mcp.server.fastmcp import FastMCP
 import threading
 import struct
@@ -527,62 +531,880 @@ def chat_send(message: str):
         return f"Error: {e}"
 
 
+######################### Config Schemas & Normalization
+#
+# Model-facing help, coercion, required-field validation and examples are all
+# derived from these registries so the documentation cannot drift from what the
+# backend actually accepts. Configs are always sent to the backend as a
+# single-encoded JSON string, preserving the server contract.
+
+CONFIG_FIELD_ALIASES = {"callback_servers": "callback_addresses"}
+
+LISTENER_TYPE_ALIASES = {
+    "beaconhttp": "BeaconHTTP", "beacon_http": "BeaconHTTP", "http": "BeaconHTTP",
+    "beaconsmb": "BeaconSMB", "beacon_smb": "BeaconSMB", "smb": "BeaconSMB",
+    "beacontcp": "BeaconTCP", "beacon_tcp": "BeaconTCP",
+    "beacondns": "BeaconDNS", "beacon_dns": "BeaconDNS", "dns": "BeaconDNS",
+    "gophertcp": "GopherTCP", "gopher_tcp": "GopherTCP", "gopher": "GopherTCP",
+}
+
+AGENT_TYPE_ALIASES = {
+    "beacon": "beacon", "beacon_agent": "beacon", "beaconagent": "beacon",
+    "gopher": "gopher", "gopher_agent": "gopher", "gopheragent": "gopher",
+}
+
+AGENT_LISTENER_TYPES = {
+    "beacon": {"BeaconHTTP", "BeaconSMB", "BeaconTCP", "BeaconDNS"},
+    "gopher": {"GopherTCP"},
+}
+
+LISTENER_SCHEMAS = {
+    "BeaconHTTP": {
+        "protocol": "http",
+        "callback_field": "callback_addresses",
+        "callback_kind": "strlist",
+        "fields": {
+            "host_bind": {"type": "str", "required": True, "desc": "bind address", "example": "0.0.0.0"},
+            "port_bind": {"type": "int", "required": True, "min": 1, "max": 65535, "desc": "bind port", "example": 8080},
+            "callback_addresses": {"type": "strlist", "required": True, "split": "comma_newline", "desc": "agent callback addresses (host:port)", "example": ["c2.example.com:80"]},
+            "encrypt_key": {"type": "key32", "required": True, "desc": "32 lowercase hex characters", "example": "00112233445566778899aabbccddeeff"},
+            "http_method": {"type": "str", "required": True, "choices": ["POST", "GET"], "desc": "HTTP method", "example": "POST"},
+            "uri": {"type": "strlist", "required": True, "split": "comma_newline", "pattern": "^/[A-Za-z0-9.=-]+(/[A-Za-z0-9.=-]+)*$", "desc": "request URI paths", "example": ["/api/v1/status"]},
+            "hb_header": {"type": "str", "required": True, "desc": "header carrying the beacon id", "example": "X-Beacon-Id"},
+            "user_agent": {"type": "strlist", "required": True, "split": "newline", "desc": "allowed User-Agent values", "example": ["Mozilla/5.0"]},
+            "page-payload": {"type": "str", "required": True, "contains": "<<<PAYLOAD_DATA>>>", "desc": "response page containing the payload placeholder", "example": "<html><body><<<PAYLOAD_DATA>>></body></html>"},
+            "ssl": {"type": "bool", "desc": "enable HTTPS", "example": False},
+            "ssl_cert": {"type": "b64", "desc": "client certificate (PEM or base64)", "example": ""},
+            "ssl_key": {"type": "b64", "desc": "client key (PEM or base64)", "example": ""},
+            "host_header": {"type": "strlist", "split": "comma_newline", "desc": "allowed Host headers", "example": []},
+            "request_headers": {"type": "headers", "desc": "extra request headers", "example": ""},
+            "x-forwarded-for": {"type": "bool", "desc": "trust X-Forwarded-For", "example": False},
+            "page-error": {"type": "str", "desc": "error page body", "example": ""},
+            "server_headers": {"type": "headers", "desc": "extra response headers", "example": ""},
+        },
+        "ignored": {
+            "ssl_cert_path": "the extender overwrites cert paths at start; use ssl_cert/ssl_key",
+            "ssl_key_path": "the extender overwrites key paths at start; use ssl_cert/ssl_key",
+            "response_headers": "the extender rebuilds response headers from server_headers",
+            "protocol": "internal field set by the extender",
+        },
+        "editable": ["callback_addresses", "user_agent", "uri", "hb_header", "x-forwarded-for", "host_header", "request_headers", "page-error", "page-payload"],
+        "example": {
+            "host_bind": "0.0.0.0",
+            "port_bind": 8080,
+            "callback_addresses": ["c2.example.com:80"],
+            "encrypt_key": "00112233445566778899aabbccddeeff",
+            "http_method": "POST",
+            "uri": ["/api/v1/status"],
+            "hb_header": "X-Beacon-Id",
+            "user_agent": ["Mozilla/5.0"],
+            "page-payload": "<html><body><<<PAYLOAD_DATA>>></body></html>",
+        },
+    },
+    "BeaconSMB": {
+        "protocol": "bind_smb",
+        "callback_field": None,
+        "fields": {
+            "pipename": {"type": "str", "required": True, "pattern": "^[A-Za-z0-9._-]+$", "desc": "named pipe name", "example": "c2pipe"},
+            "encrypt_key": {"type": "key32", "required": True, "desc": "32 lowercase hex characters", "example": "00112233445566778899aabbccddeeff"},
+        },
+        "ignored": {"protocol": "internal field set by the extender"},
+        "editable": [],
+        "example": {"pipename": "c2pipe", "encrypt_key": "00112233445566778899aabbccddeeff"},
+    },
+    "BeaconTCP": {
+        "protocol": "bind_tcp",
+        "callback_field": None,
+        "fields": {
+            "port_bind": {"type": "int", "required": True, "min": 1, "max": 65535, "desc": "bind port", "example": 8443},
+            "encrypt_key": {"type": "key32", "required": True, "desc": "32 lowercase hex characters", "example": "00112233445566778899aabbccddeeff"},
+            "prepend_data": {"type": "str", "desc": "optional data prepended to traffic", "example": ""},
+        },
+        "ignored": {"protocol": "internal field set by the extender", "host_bind": "BeaconTCP binds all interfaces; host_bind is not a backend field"},
+        "editable": [],
+        "example": {"port_bind": 8443, "encrypt_key": "00112233445566778899aabbccddeeff"},
+    },
+    "BeaconDNS": {
+        "protocol": "dns",
+        "callback_field": None,
+        "callback_kind": "domain",
+        "fields": {
+            "host_bind": {"type": "str", "required": True, "desc": "bind address", "example": "0.0.0.0"},
+            "port_bind": {"type": "int", "required": True, "min": 1, "max": 65535, "desc": "bind port (usually 53)", "example": 53},
+            "domain": {"type": "domain", "required": True, "desc": "DNS tunnel domain (comma-separated for multiple)", "example": "dns.example.com"},
+            "encrypt_key": {"type": "key6_32", "required": True, "desc": "6-32 character key (hex not required)", "example": "a1b2c3d4e5f60718293a4b5c6d7e8f90"},
+            "pkt_size": {"type": "int", "desc": "DNS packet size", "example": 4096},
+            "ttl": {"type": "int", "desc": "DNS TTL", "example": 10},
+            "burst_enabled": {"type": "bool", "desc": "enable burst mode", "example": False},
+            "burst_sleep": {"type": "int", "desc": "burst sleep in ms", "example": 50},
+            "burst_jitter": {"type": "int", "desc": "burst jitter in ms", "example": 0},
+        },
+        "ignored": {"protocol": "internal field set by the extender", "domains": "internal list built from domain"},
+        "editable": ["domain", "ttl", "pkt_size", "burst_enabled", "burst_sleep", "burst_jitter"],
+        "example": {
+            "host_bind": "0.0.0.0",
+            "port_bind": 53,
+            "domain": "dns.example.com",
+            "encrypt_key": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        },
+    },
+    "GopherTCP": {
+        "protocol": "tcp",
+        "callback_field": "callback_addresses",
+        "callback_kind": "textlist",
+        "fields": {
+            "host_bind": {"type": "str", "required": True, "desc": "bind address", "example": "0.0.0.0"},
+            "port_bind": {"type": "int", "required": True, "min": 1, "max": 65535, "desc": "bind port", "example": 9091},
+            "callback_addresses": {"type": "textlist", "required": True, "desc": "newline-separated callback addresses (host:port or ws:// / wss:// URL)", "example": "c2.example.com:9091"},
+            "encrypt_key": {"type": "key32", "required": True, "desc": "32 lowercase hex characters", "example": "00112233445566778899aabbccddeeff"},
+            "timeout": {"type": "int", "required": True, "min": 1, "desc": "connection timeout seconds", "example": 10},
+            "ssl": {"type": "bool", "desc": "enable mTLS", "example": False},
+            "ca_cert": {"type": "b64", "desc": "CA certificate (PEM or base64)", "example": ""},
+            "server_cert": {"type": "b64", "desc": "server certificate (PEM or base64)", "example": ""},
+            "server_key": {"type": "b64", "desc": "server key (PEM or base64)", "example": ""},
+            "client_cert": {"type": "b64", "desc": "client certificate for mTLS agents", "example": ""},
+            "client_key": {"type": "b64", "desc": "client key for mTLS agents", "example": ""},
+            "tcp_banner": {"type": "str", "desc": "banner sent before encryption", "example": "AdaptixC2 server\n"},
+            "error_answer": {"type": "str", "desc": "response on connection error", "example": ""},
+        },
+        "ignored": {"protocol": "internal field set by the extender"},
+        "editable": ["callback_addresses", "tcp_banner", "error_answer", "timeout"],
+        "example": {
+            "host_bind": "0.0.0.0",
+            "port_bind": 9091,
+            "callback_addresses": "c2.example.com:9091",
+            "encrypt_key": "00112233445566778899aabbccddeeff",
+            "timeout": 10,
+        },
+    },
+}
+
+AGENT_SCHEMAS = {
+    "beacon": {
+        "fields": {
+            "os": {"type": "str", "required": True, "choices": ["windows"], "case_insensitive": True, "desc": "target OS", "example": "windows"},
+            "arch": {"type": "str", "required": True, "choices": ["x64", "x86"], "case_insensitive": True, "desc": "target architecture", "example": "x64"},
+            "format": {"type": "str", "required": True, "choices": ["Exe", "Service Exe", "DLL", "Shellcode"], "case_insensitive": True, "desc": "payload format", "example": "Exe"},
+            "sleep": {"type": "duration", "desc": "callback interval, e.g. 10s", "example": "10s"},
+            "jitter": {"type": "int", "min": 0, "max": 100, "desc": "jitter percent", "example": 20},
+            "svcname": {"type": "str", "desc": "service name (Service Exe)", "example": ""},
+            "is_killdate": {"type": "bool", "desc": "enable kill date", "example": False},
+            "kill_date": {"type": "str", "desc": "kill date DD.MM.YYYY (ISO is auto-converted)", "example": "01.01.2027"},
+            "kill_time": {"type": "str", "desc": "kill time HH:MM:SS (HH:MM is auto-converted)", "example": "12:00:00"},
+            "is_workingtime": {"type": "bool", "desc": "enable working-hours window", "example": False},
+            "start_time": {"type": "str", "desc": "working window start HH:MM", "example": "09:00"},
+            "end_time": {"type": "str", "desc": "working window end HH:MM", "example": "18:00"},
+            "iat_hiding": {"type": "bool", "desc": "IAT hiding", "example": False},
+            "is_sideloading": {"type": "bool", "desc": "DLL sideloading mode", "example": False},
+            "sideloading_content": {"type": "str", "desc": "base64 sideloading binary", "example": ""},
+            "dns_resolvers": {"type": "strlist", "split": "comma_newline", "desc": "custom DNS resolvers", "example": []},
+            "doh_resolvers": {"type": "strlist", "split": "comma_newline", "desc": "DoH resolvers", "example": []},
+            "dns_mode": {"type": "str", "desc": "DNS resolution mode", "example": ""},
+            "user_agent": {"type": "str", "desc": "HTTP user-agent", "example": ""},
+            "use_proxy": {"type": "bool", "desc": "route through proxy", "example": False},
+            "proxy_type": {"type": "str", "choices": ["https", "socks5"], "case_insensitive": True, "desc": "proxy type", "example": "https"},
+            "proxy_host": {"type": "str", "desc": "proxy host", "example": ""},
+            "proxy_port": {"type": "int", "desc": "proxy port", "example": 8080},
+            "proxy_username": {"type": "str", "desc": "proxy username", "example": ""},
+            "proxy_password": {"type": "str", "desc": "proxy password", "example": ""},
+            "rotation_mode": {"type": "str", "choices": ["round-robin", "random"], "desc": "listener rotation", "example": "round-robin"},
+        },
+        "example": {"os": "windows", "arch": "x64", "format": "Exe", "sleep": "10s", "jitter": 20},
+    },
+    "gopher": {
+        "fields": {
+            "os": {"type": "str", "required": True, "choices": ["windows", "linux", "macos"], "case_insensitive": True, "desc": "target OS", "example": "linux"},
+            "arch": {"type": "str", "required": True, "choices": ["amd64", "arm64"], "case_insensitive": True, "desc": "target architecture", "example": "amd64"},
+            "format": {"type": "str", "desc": "payload format", "example": "Exe"},
+            "win7_support": {"type": "bool", "desc": "Windows 7 compatibility", "example": False},
+            "reconn_timeout": {"type": "duration", "desc": "reconnect timeout, e.g. 30s", "example": "30s"},
+            "reconn_count": {"type": "int", "desc": "max reconnect attempts", "example": 0},
+            "chain_enabled": {"type": "bool", "desc": "enable chain resolver", "example": False},
+            "chain_rpc": {"type": "str", "desc": "chain RPC endpoint", "example": ""},
+            "chain_id": {"type": "int", "desc": "chain id", "example": 0},
+            "chain_contract": {"type": "str", "desc": "chain contract address", "example": ""},
+            "chain_poll_sec": {"type": "int", "desc": "chain poll interval seconds", "example": 60},
+        },
+        "example": {"os": "linux", "arch": "amd64", "format": "Exe", "reconn_timeout": "30s"},
+    },
+}
+
+
+def _type_name(value):
+    if isinstance(value, dict):
+        return "an object"
+    if isinstance(value, list):
+        return "a list"
+    if isinstance(value, bool):
+        return "a boolean"
+    if isinstance(value, (int, float)):
+        return "a number"
+    if isinstance(value, str):
+        return "a string"
+    return type(value).__name__
+
+
+def _coerce_config_object(config):
+    """Accept dict, JSON string, double-encoded JSON or a Python-literal dict."""
+    warnings = []
+    layers = 0
+    value = config
+    while True:
+        if isinstance(value, dict):
+            if set(value.keys()) == {"config"} and len(value) == 1:
+                warnings.append("config was wrapped in a single-key {'config': ...} object; unwrapped")
+                value = value["config"]
+                continue
+            if layers:
+                warnings.append("config was JSON-encoded %d extra time(s); decoded automatically" % layers)
+            return value, warnings, None
+        if not isinstance(value, str):
+            return None, warnings, "config must be a JSON object or a JSON string; got %s" % _type_name(value)
+        text = value.strip()
+        if not text:
+            return None, warnings, "config is empty; expected a JSON object"
+        if layers >= 4:
+            return None, warnings, "config is nested too deeply (more than 4 encoding layers)"
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            try:
+                parsed = ast.literal_eval(text)
+                warnings.append("config used Python-literal syntax; JSON is preferred")
+            except Exception as exc:
+                return None, warnings, "config is not valid JSON: %s" % exc
+        if isinstance(parsed, str):
+            value = parsed
+            layers += 1
+            continue
+        value = parsed
+
+
+def _canonical_type(value, aliases, valid):
+    raw = str(value or "").strip()
+    if raw in valid:
+        return raw, ""
+    key = raw.lower().replace("-", "_").replace(" ", "")
+    if key in aliases:
+        return aliases[key], "type '%s' normalized to '%s'" % (raw, aliases[key])
+    squashed = raw.lower().replace("_", "").replace("-", "").replace(" ", "")
+    for alias, canon in aliases.items():
+        if alias.replace("_", "") == squashed:
+            return canon, "type '%s' normalized to '%s'" % (raw, canon)
+    return raw, "unknown type '%s' (supported: %s)" % (raw, ", ".join(sorted(valid)))
+
+
+def _validate_listener_name(name):
+    text = str(name or "").strip()
+    if not text:
+        return "name is required"
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        return "name '%s' is invalid; use letters, digits, dash or underscore only" % text
+    return None
+
+
+def _callback_shape(kind):
+    if kind == "textlist":
+        return 'a newline-separated string, e.g. "c2.example.com:443" or "wss://c2.example.com/ws?k=..."'
+    if kind == "domain":
+        return 'a DNS domain string, e.g. "dns.example.com"'
+    return 'a list of host:port strings, e.g. ["c2.example.com:443"]'
+
+
+def _bare_listener_name(value):
+    if isinstance(value, list):
+        if len(value) != 1:
+            return ""
+        value = value[0]
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text or ":" in text or "/" in text:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9._-]+", text):
+        return text
+    return ""
+
+
+def _missing_callback_message(field, kind):
+    return ("missing required field '%s': expected %s. Pass callback_from=\"<running-listener>\" "
+            "to inherit it, or set it explicitly." % (field, _callback_shape(kind)))
+
+
+def _resolve_field_key(schema, index, key):
+    if key in schema["fields"]:
+        return key, ""
+    norm = str(key).lower().replace("-", "_")
+    if norm in index:
+        return index[norm], "field '%s' mapped to '%s'" % (key, index[norm])
+    alias = CONFIG_FIELD_ALIASES.get(norm)
+    if alias and alias in schema["fields"]:
+        return alias, "field '%s' is an alias of '%s'" % (key, alias)
+    close = difflib.get_close_matches(str(key), list(schema["fields"].keys()), n=1, cutoff=0.72)
+    hint = "; did you mean '%s'?" % close[0] if close else ""
+    return None, "unknown field '%s'%s (kept as-is; the backend may ignore it)" % (key, hint)
+
+
+def _coerce_field_value(name, spec, value):
+    warnings = []
+    if value is None:
+        return None, warnings, None
+    ftype = spec.get("type", "str")
+
+    def bad(expected):
+        return None, warnings, "field '%s' expects %s; got %s" % (name, expected, _type_name(value))
+
+    if ftype == "str":
+        if isinstance(value, list):
+            if len(value) != 1:
+                return bad("a string")
+            warnings.append("field '%s' received a one-element list; using its value" % name)
+            value = value[0]
+        if isinstance(value, dict):
+            return bad("a string")
+        value = str(value)
+    elif ftype == "int":
+        if isinstance(value, bool):
+            return bad("an integer")
+        if isinstance(value, int):
+            pass
+        elif isinstance(value, float):
+            if not value.is_integer():
+                return bad("an integer")
+            value = int(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not re.fullmatch(r"[+-]?\d+", text):
+                return bad("an integer")
+            value = int(text)
+        else:
+            return bad("an integer")
+    elif ftype == "bool":
+        if isinstance(value, bool):
+            pass
+        elif isinstance(value, int) and value in (0, 1):
+            value = bool(value)
+        elif isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("true", "yes", "on", "1"):
+                value = True
+            elif text in ("false", "no", "off", "0"):
+                value = False
+            else:
+                return bad("a boolean")
+        else:
+            return bad("a boolean")
+    elif ftype in ("strlist", "textlist"):
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        value = parsed
+                except Exception:
+                    pass
+            if isinstance(value, str):
+                split = spec.get("split", "comma_newline")
+                if split == "newline":
+                    value = value.split("\n")
+                elif split == "none":
+                    value = [value]
+                else:
+                    value = re.split(r"[,\n]", value)
+        elif not isinstance(value, list):
+            value = [value]
+        parts = [str(item).strip() for item in value if item is not None]
+        parts = [item for item in parts if item]
+        value = "\n".join(parts) if ftype == "textlist" else parts
+    elif ftype == "domain":
+        if isinstance(value, list):
+            value = ",".join(str(item).strip() for item in value if str(item).strip())
+        else:
+            value = str(value)
+    elif ftype == "key32":
+        text = str(value).strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", text):
+            return None, warnings, "field '%s' must be exactly 32 lowercase hex characters" % name
+        if text != str(value).strip():
+            warnings.append("field '%s' was lowercased" % name)
+        value = text
+    elif ftype == "key6_32":
+        text = str(value)
+        if not (6 <= len(text) <= 32):
+            return None, warnings, "field '%s' must be 6-32 characters" % name
+        value = text
+    elif ftype == "b64":
+        text = str(value)
+        if "-----BEGIN" in text:
+            value = base64.b64encode(text.encode()).decode()
+            warnings.append("field '%s' received PEM text; base64-encoded automatically" % name)
+        else:
+            value = text
+    elif ftype == "headers":
+        if isinstance(value, dict):
+            value = "\n".join("%s: %s" % (k, v) for k, v in value.items())
+        elif isinstance(value, list):
+            value = "\n".join(str(item) for item in value)
+        else:
+            value = str(value)
+        for line in value.splitlines():
+            line = line.strip()
+            if line and ":" not in line:
+                warnings.append("field '%s' line lacks ':': %s" % (name, line))
+    elif ftype == "duration":
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            value = "%ss" % int(value)
+        elif isinstance(value, str) and re.fullmatch(r"\d+", value.strip()):
+            value = "%ss" % value.strip()
+        else:
+            value = str(value)
+    else:
+        value = str(value)
+
+    choices = spec.get("choices")
+    if choices and isinstance(value, str):
+        if spec.get("case_insensitive"):
+            for choice in choices:
+                if value.lower() == choice.lower():
+                    value = choice
+                    break
+            else:
+                return None, warnings, "field '%s' must be one of %s" % (name, choices)
+        elif value not in choices:
+            return None, warnings, "field '%s' must be one of %s" % (name, choices)
+    pattern = spec.get("pattern")
+    if pattern:
+        if isinstance(value, str) and not re.fullmatch(pattern, value):
+            return None, warnings, "field '%s' does not match the required format %s" % (name, pattern)
+        if isinstance(value, list):
+            for item in value:
+                if not re.fullmatch(pattern, item):
+                    return None, warnings, "field '%s' element %r does not match %s" % (name, item, pattern)
+    needle = spec.get("contains")
+    if needle and isinstance(value, str) and needle not in value:
+        return None, warnings, "field '%s' must contain %r" % (name, needle)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "min" in spec and value < spec["min"]:
+            return None, warnings, "field '%s' must be >= %s" % (name, spec["min"])
+        if "max" in spec and value > spec["max"]:
+            return None, warnings, "field '%s' must be <= %s" % (name, spec["max"])
+    if isinstance(value, str):
+        if "min_len" in spec and len(value) < spec["min_len"]:
+            return None, warnings, "field '%s' must be at least %d characters" % (name, spec["min_len"])
+        if "max_len" in spec and len(value) > spec["max_len"]:
+            return None, warnings, "field '%s' must be at most %d characters" % (name, spec["max_len"])
+    return value, warnings, None
+
+
+def _normalize_listener_config(listener_type, config, callback_from="", merge_base=None, lookup=None, source="create"):
+    """Parse, alias, coerce, merge and validate a listener config.
+
+    Returns (data, warnings, errors, caller_keys).
+    """
+    schema = LISTENER_SCHEMAS[listener_type]
+    obj, warnings, error = _coerce_config_object(config)
+    if error:
+        return None, warnings, [error], set()
+
+    index = {name.lower().replace("-", "_"): name for name in schema["fields"]}
+    mapped = {}
+    caller_keys = set()
+    for key, value in obj.items():
+        canonical, note = _resolve_field_key(schema, index, key)
+        if canonical is None:
+            mapped[str(key)] = value
+            if note:
+                warnings.append(note)
+            continue
+        if canonical in mapped:
+            warnings.append("both '%s' and '%s' provided; using the latter" % (key, canonical))
+        mapped[canonical] = value
+        caller_keys.add(canonical)
+        if note:
+            warnings.append(note)
+
+    data = {}
+    if merge_base:
+        data.update(merge_base)
+    for key, value in mapped.items():
+        if value is None:
+            continue
+        data[key] = value
+
+    errors = []
+    for key in list(data.keys()):
+        spec = schema["fields"].get(key)
+        if spec is None:
+            continue
+        coerced, warns, err = _coerce_field_value(key, spec, data[key])
+        if err:
+            errors.append(err)
+            continue
+        data[key] = coerced
+        if key in caller_keys:
+            warnings.extend(warns)
+
+    callback_field = schema.get("callback_field")
+    if callback_field:
+        kind = schema.get("callback_kind", "strlist")
+        current = data.get(callback_field)
+        bare = _bare_listener_name(current)
+        caller_supplied = callback_field in caller_keys
+        base_has = bool(merge_base and merge_base.get(callback_field))
+
+        def _inherit(source_name):
+            value, desc, err = lookup(source_name, kind) if lookup else (None, "", "listener lookup unavailable")
+            if err:
+                errors.append(err)
+                return
+            data[callback_field] = value
+            warnings.append("inherited %s from listener '%s' (%s)" % (callback_field, source_name, desc))
+
+        if bare:
+            _inherit(bare)
+        elif caller_supplied and (current is None or current == "" or current == []):
+            if source == "edit":
+                errors.append("cannot clear required field '%s'" % callback_field)
+            elif callback_from:
+                _inherit(callback_from)
+            else:
+                errors.append(_missing_callback_message(callback_field, kind))
+        elif not caller_supplied:
+            if base_has:
+                pass
+            elif callback_from:
+                _inherit(callback_from)
+            else:
+                errors.append(_missing_callback_message(callback_field, kind))
+        elif callback_from:
+            warnings.append("callback_from ignored because '%s' was provided explicitly" % callback_field)
+
+    for key, spec in schema["fields"].items():
+        if not spec.get("required"):
+            continue
+        value = data.get(key)
+        if value is None or value == "" or value == []:
+            if not any(key in err for err in errors):
+                errors.append("missing required field '%s' (%s)" % (key, spec.get("desc", "")))
+
+    if listener_type == "GopherTCP" and data.get("ssl"):
+        missing = [k for k in ("ca_cert", "server_cert", "server_key") if not data.get(k)]
+        if missing:
+            errors.append("ssl=true requires %s" % ", ".join(missing))
+    if listener_type == "BeaconHTTP" and data.get("ssl") and not (data.get("ssl_cert") and data.get("ssl_key")):
+        warnings.append("ssl=true without ssl_cert/ssl_key; the listener will use its managed certificate")
+
+    return data, warnings, errors, caller_keys
+
+
+def _normalize_agent_config(agent_type, config):
+    schema = AGENT_SCHEMAS[agent_type]
+    obj, warnings, error = _coerce_config_object(config)
+    if error:
+        return None, warnings, [error], set()
+
+    index = {name.lower().replace("-", "_"): name for name in schema["fields"]}
+    mapped = {}
+    caller_keys = set()
+    for key, value in obj.items():
+        canonical, note = _resolve_field_key(schema, index, key)
+        if canonical is None:
+            mapped[str(key)] = value
+            if note:
+                warnings.append(note)
+            continue
+        mapped[canonical] = value
+        caller_keys.add(canonical)
+        if note:
+            warnings.append(note)
+
+    errors = []
+    for key in list(mapped.keys()):
+        spec = schema["fields"].get(key)
+        if spec is None:
+            continue
+        coerced, warns, err = _coerce_field_value(key, spec, mapped[key])
+        if err:
+            errors.append(err)
+            continue
+        mapped[key] = coerced
+        warnings.extend(warns)
+
+    if agent_type == "beacon":
+        kill_date = mapped.get("kill_date")
+        if isinstance(kill_date, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", kill_date.strip()):
+            year, month, day = kill_date.strip().split("-")
+            mapped["kill_date"] = "%s.%s.%s" % (day, month, year)
+            warnings.append("kill_date converted to DD.MM.YYYY (backend format)")
+        kill_time = mapped.get("kill_time")
+        if isinstance(kill_time, str) and re.fullmatch(r"\d{1,2}:\d{2}", kill_time.strip()):
+            mapped["kill_time"] = kill_time.strip() + ":00"
+            warnings.append("kill_time converted to HH:MM:SS (backend format)")
+        if mapped.get("format") == "Service Exe" and not mapped.get("svcname"):
+            errors.append("format 'Service Exe' requires svcname")
+        if not mapped.get("sleep"):
+            warnings.append("sleep was not specified; the payload will use the server default")
+
+    for key, spec in schema["fields"].items():
+        if not spec.get("required"):
+            continue
+        value = mapped.get(key)
+        if value is None or value == "" or value == []:
+            if not any(key in err for err in errors):
+                errors.append("missing required field '%s' (%s)" % (key, spec.get("desc", "")))
+
+    return mapped, warnings, errors, caller_keys
+
+
+def _normalize_listener_names(value):
+    if value is None:
+        return [], []
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    value = parsed
+            except Exception:
+                pass
+    if isinstance(value, str):
+        value = re.split(r"[,\s]+", value)
+    if not isinstance(value, list):
+        value = [value]
+    names = []
+    for item in value:
+        name = str(item).strip()
+        if name and name not in names:
+            names.append(name)
+    return names, []
+
+
+def _check_agent_listener_compatibility(agent_type, records, names):
+    if not records:
+        return [], []
+    errors = []
+    by_name = {rec.get("l_name"): rec for rec in records}
+    allowed = AGENT_LISTENER_TYPES.get(agent_type, set())
+    for name in names:
+        rec = by_name.get(name)
+        if not rec:
+            available = ", ".join(sorted(k for k in by_name if k)) or "none"
+            errors.append("listener '%s' does not exist; running listeners: %s" % (name, available))
+            continue
+        reg = rec.get("l_reg_name", "")
+        if allowed and reg not in allowed:
+            errors.append("listener '%s' is %s, which cannot be embedded in a %s payload (allowed: %s)"
+                          % (name, reg, agent_type, ", ".join(sorted(allowed))))
+    return errors, []
+
+
+def _fetch_listener_records():
+    try:
+        response = requests.get(f"https://{endpoint}/listener/list", headers=_api_headers(), verify=False, timeout=10)
+        records = response.json()
+        if records is None:
+            return [], None
+        if not isinstance(records, list):
+            return [], "listener/list returned unexpected data"
+        return records, None
+    except Exception as exc:
+        return [], "could not list listeners: %s" % exc
+
+
+def _find_listener_record(records, name):
+    for rec in records:
+        if rec.get("l_name") == name:
+            return rec, ""
+    lowered = {str(rec.get("l_name", "")).lower(): rec for rec in records}
+    if name.lower() in lowered:
+        return lowered[name.lower()], "listener name matched case-insensitively"
+    return None, ""
+
+
+def _parse_listener_data(record):
+    raw = record.get("l_data")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
+
+
+def _lookup_callback_from_teamserver(source_name, kind):
+    records, err = _fetch_listener_records()
+    if err:
+        return None, "", err
+    rec, note = _find_listener_record(records, source_name)
+    if not rec:
+        available = ", ".join(sorted(str(r.get("l_name", "")) for r in records)) or "none"
+        return None, "", "listener '%s' not found; running listeners: %s" % (source_name, available)
+    data = _parse_listener_data(rec)
+    value = data.get("callback_addresses") or data.get("domain") or rec.get("l_agent_addr") or ""
+    if not value:
+        return None, "", "listener '%s' has no callback address" % source_name
+    if kind == "textlist":
+        if isinstance(value, list):
+            parts = [str(item) for item in value]
+        else:
+            parts = re.split(r"[,\n]", str(value))
+        parts = [part.strip() for part in parts if part.strip()]
+        value = "\n".join(parts)
+    else:
+        if isinstance(value, str):
+            parts = re.split(r"[,\n]", value)
+        else:
+            parts = [str(item) for item in value]
+        value = [part.strip() for part in parts if part.strip()]
+    return value, "type=%s, value=%r" % (rec.get("l_reg_name", "?"), value), None
+
+
+def _format_config_errors(subject, errors, warnings, example, records=None):
+    lines = ["Failed: invalid config for %s." % subject]
+    for idx, err in enumerate(errors, 1):
+        lines.append("  %d. %s" % (idx, err))
+    if warnings:
+        lines.append("Warnings:")
+        lines.extend("  - %s" % warning for warning in warnings)
+    if records:
+        usable = []
+        for rec in records:
+            addr = _parse_listener_data(rec).get("callback_addresses") or rec.get("l_agent_addr")
+            if addr:
+                usable.append("%s (%s, callback=%s)" % (rec.get("l_name"), rec.get("l_reg_name"), addr))
+        if usable:
+            lines.append("Running listeners that can supply a callback:")
+            lines.extend("  - %s" % item for item in usable)
+    lines.append("Minimal working example (copy and adjust):")
+    lines.append(json.dumps(example, ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def _translate_backend_error(message, warnings=None):
+    text = str(message or "unknown error")
+    match = re.search(r"cannot unmarshal .*? into TransportConfig\.([A-Za-z0-9_]+) of Go type (\[\]string|string|int|bool)", text)
+    if match:
+        field, got = match.group(1), match.group(2)
+        expected = {"[]string": "a list of strings", "string": "a string", "int": "an integer", "bool": "a boolean"}.get(got, got)
+        text = "field '%s' expects %s (the backend rejected a different JSON type)" % (field, expected)
+    if "callback_servers" in text:
+        text = text.replace("callback_servers", "callback_addresses")
+    for go_name, json_name in (("HostBind", "host_bind"), ("PortBind", "port_bind"), ("Pipename", "pipename")):
+        text = text.replace(go_name, json_name)
+    lines = ["Failed: %s" % text]
+    for warning in (warnings or []):
+        lines.append("Note: %s" % warning)
+    return "\n".join(lines)
+
+
+def _render_listener_help(mode="create"):
+    lines = []
+    if mode == "create":
+        lines.append("Create and start a new listener. config accepts a JSON object OR a JSON string; double-encoded JSON is also accepted.")
+        lines.append("Missing callback_addresses can be inherited: pass callback_from=\"<running-listener>\".")
+    else:
+        lines.append("Edit a running listener. config is a PATCH: omitted fields keep their current values; provided fields override them.")
+        lines.append("Only the listed live-editable fields apply without a recreate/restart.")
+    for ltype, schema in LISTENER_SCHEMAS.items():
+        lines.append("")
+        lines.append("%s:" % ltype)
+        for fname, spec in schema["fields"].items():
+            flag = "required" if spec.get("required") else "optional"
+            extra = ""
+            if spec.get("choices"):
+                extra = "; one of %s" % ", ".join(str(choice) for choice in spec["choices"])
+            if spec.get("contains"):
+                extra = "; must contain %s" % spec["contains"]
+            lines.append("  %s (%s, %s): %s%s" % (fname, spec.get("type", "str"), flag, spec.get("desc", ""), extra))
+        if schema.get("ignored"):
+            lines.append("  ignored: %s" % ", ".join(sorted(schema["ignored"].keys())))
+        if mode == "edit":
+            lines.append("  live-editable: %s" % (", ".join(schema.get("editable") or []) or "none"))
+        lines.append("  example: %s" % json.dumps(schema["example"], ensure_ascii=False))
+    return "\n".join(lines)
+
+
+def _render_agent_help():
+    lines = [
+        "Generate an agent payload. agent_type: beacon or gopher.",
+        "listener_names: comma-separated string or list; existing listeners can be reused by name.",
+        "config accepts a JSON object OR a JSON string; double-encoded JSON is also accepted.",
+    ]
+    for atype, schema in AGENT_SCHEMAS.items():
+        lines.append("")
+        lines.append("%s:" % atype)
+        for fname, spec in schema["fields"].items():
+            flag = "required" if spec.get("required") else "optional"
+            extra = ""
+            if spec.get("choices"):
+                extra = "; one of %s" % ", ".join(str(choice) for choice in spec["choices"])
+            lines.append("  %s (%s, %s): %s%s" % (fname, spec.get("type", "str"), flag, spec.get("desc", ""), extra))
+        lines.append("  example: %s" % json.dumps(schema["example"], ensure_ascii=False))
+    lines.append("")
+    lines.append("compatibility: beacon -> BeaconHTTP/BeaconSMB/BeaconTCP/BeaconDNS; gopher -> GopherTCP")
+    return "\n".join(lines)
+
+
+def _minimal_example(listener_type):
+    return LISTENER_SCHEMAS.get(listener_type, {}).get("example", {})
+
+
 ######################### Server Tools - Agent Generation
 
 PAYLOADS_DIR = os.environ.get("ADAPTIX_PAYLOADS_DIR", os.path.join(os.path.dirname(__file__), "payloads"))
 
 
-@server.tool()
-def agent_generate(agent_type: str, listener_names: str, config: str):
-    """Generate an agent payload binary.
-    agent_type: "beacon" or "gopher"
-    listener_names: comma-separated listener names to embed, e.g. "https-listener,smb"
-    config: JSON string with agent build configuration
+@server.tool(description=_render_agent_help())
+def agent_generate(
+    agent_type: str,
+    listener_names: Union[str, List[str]],
+    config: Union[str, Dict[str, Any]],
+):
+    """Generate a payload. The full field reference is generated from the schema registry."""
+    canonical, note = _canonical_type(agent_type, AGENT_TYPE_ALIASES, set(AGENT_SCHEMAS))
+    warnings = []
+    if note:
+        warnings.append(note)
+    if canonical not in AGENT_SCHEMAS:
+        return "Failed: unsupported agent_type '%s'. Supported: beacon, gopher." % agent_type
 
-    Beacon config fields:
-      os (str): "windows"
-      arch (str): "x64" or "x86"
-      format (str): "Exe", "Service Exe", "DLL", or "Shellcode"
-      sleep (str): callback interval e.g. "5s", "1m", "30s"
-      jitter (int): jitter percentage 0-100
-      svcname (str): service name (for Service Exe format)
-      is_killdate (bool): enable kill date
-      kill_date (str): kill date "YYYY-MM-DD"
-      kill_time (str): kill time "HH:MM"
-      is_workingtime (bool): enable working hours restriction
-      start_time (str): working start "HH:MM"
-      end_time (str): working end "HH:MM"
-      iat_hiding (bool): IAT hiding for anti-analysis
-      is_sideloading (bool): DLL sideloading mode
-      sideloading_content (str): base64-encoded sideloading binary
-      rotation_mode (str): "round-robin" or "random" listener rotation
-      use_proxy (bool): route through proxy
-      proxy_type (str): "https" or "socks5"
-      proxy_host (str): proxy address
-      proxy_port (int): proxy port
-      proxy_username (str): proxy auth user
-      proxy_password (str): proxy auth password
-      user_agent (str): HTTP user-agent string
+    names, name_warnings = _normalize_listener_names(listener_names)
+    warnings.extend(name_warnings)
+    if not names:
+        return "Failed: listener_names is empty; pass the name of a running listener."
 
-    Gopher config fields:
-      os (str): "windows", "linux", or "macos"
-      arch (str): "amd64" or "arm64"
-      format (str): output format
-      win7_support (bool): Windows 7 compatibility
-      reconn_timeout (str): reconnect timeout e.g. "30s"
-      reconn_count (int): max reconnect attempts
-    """
-    listeners = [l.strip() for l in listener_names.split(",") if l.strip()]
+    records, records_err = _fetch_listener_records()
+    if records_err:
+        warnings.append(records_err)
+    else:
+        compat_errors, _ = _check_agent_listener_compatibility(canonical, records, names)
+        if compat_errors:
+            return _format_config_errors("agent %s" % canonical, compat_errors, warnings,
+                                         AGENT_SCHEMAS[canonical]["example"], records)
+
+    data, cfg_warnings, errors, _ = _normalize_agent_config(canonical, config)
+    warnings.extend(cfg_warnings)
+    if errors:
+        return _format_config_errors("agent %s" % canonical, errors, warnings,
+                                     AGENT_SCHEMAS[canonical]["example"])
+
     r = requests.post(
         f"https://{endpoint}/agent/generate",
         headers=_api_headers(),
-        json={"agent": agent_type, "listener_name": listeners, "config": config},
+        json={"agent": canonical, "listener_name": names,
+              "config": json.dumps(data, ensure_ascii=False)},
         verify=False,
     )
     try:
         resp = r.json()
         if not resp.get("ok"):
-            return f"Failed: {resp.get('message', 'unknown error')}"
+            return _translate_backend_error(resp.get("message", "unknown error"), warnings)
 
         encoded = resp["message"]
         filename_b64, content_b64 = encoded.split(":", 1)
@@ -594,7 +1416,11 @@ def agent_generate(agent_type: str, listener_names: str, config: str):
         with open(filepath, "wb") as f:
             f.write(content)
 
-        return f"Payload saved: {filepath} ({len(content)} bytes)"
+        lines = ["Payload saved: %s (%d bytes)" % (filepath, len(content))]
+        lines.append("agent=%s, listeners=%s" % (canonical, ", ".join(names)))
+        for warning in warnings:
+            lines.append("Note: %s" % warning)
+        return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
@@ -645,97 +1471,120 @@ def listener_list():
         return f"Error: {e}"
 
 
-@server.tool()
-def listener_create(name: str, listener_type: str, config: str):
-    """Create and start a new listener.
-    name: unique listener name (alphanumeric, dash, underscore only)
-    listener_type: one of the registered types below
-    config: JSON string with listener-specific configuration (see below)
+@server.tool(description=_render_listener_help("create"))
+def listener_create(
+    name: str,
+    listener_type: str,
+    config: Union[str, Dict[str, Any]],
+    callback_from: str = "",
+):
+    """Create a listener. Full field reference is generated from the schema registry."""
+    name_err = _validate_listener_name(name)
+    if name_err:
+        return "Failed: %s" % name_err
 
-    Available listener types and their config fields:
+    canonical, note = _canonical_type(listener_type, LISTENER_TYPE_ALIASES, set(LISTENER_SCHEMAS))
+    warnings = []
+    if note:
+        warnings.append(note)
 
-    BeaconHTTP:
-      host_bind (str): bind address, e.g. "0.0.0.0"
-      port_bind (int): bind port, e.g. 443
-      callback_addresses (list[str]): agent callback addresses, e.g. ["domain.com:443"]
-      encrypt_key (str): 32 hex char encryption key (required)
-      ssl (bool): enable HTTPS
-      ssl_cert_path (str): path to SSL cert (if ssl=true)
-      ssl_key_path (str): path to SSL key (if ssl=true)
-      http_method (str): HTTP method, e.g. "POST"
-      uri (list[str]): URI paths, e.g. ["/api", "/update"]
-      hb_header (str): parameter name for beacon data
-      user_agent (list[str]): allowed user agents
-      host_header (list[str]): allowed host headers
-      server_headers (str): extra response headers, e.g. "Server: nginx"
-      x-forwarded-for (bool): trust X-Forwarded-For header
+    records = None
+    if canonical not in LISTENER_SCHEMAS:
+        config_str = config if isinstance(config, str) else json.dumps(config, ensure_ascii=False)
+        warnings.append("listener_type '%s' is not in the schema registry; config is passed through unchanged" % listener_type)
+    else:
+        records, records_err = _fetch_listener_records()
+        if records_err:
+            warnings.append(records_err)
+            records = None
+        data, cfg_warnings, errors, _ = _normalize_listener_config(
+            canonical, config, callback_from=callback_from,
+            lookup=_lookup_callback_from_teamserver, source="create")
+        warnings.extend(cfg_warnings)
+        if errors:
+            return _format_config_errors(canonical, errors, warnings,
+                                         _minimal_example(canonical), records)
+        config_str = json.dumps(data, ensure_ascii=False)
 
-    BeaconSMB:
-      pipename (str): named pipe name, e.g. "test" (creates \\\\.\\pipe\\test)
-      encrypt_key (str): 32 hex char encryption key (required)
-
-    BeaconTCP:
-      port_bind (int): bind port
-      encrypt_key (str): 32 hex char encryption key (required)
-      prepend_data (str): optional prepend data
-
-    BeaconDNS:
-      host_bind (str): bind address
-      port_bind (int): bind port (usually 53)
-      domain (str): DNS domain for tunneling
-      encrypt_key (str): 32 hex char encryption key (required)
-      pkt_size (int): DNS packet size
-      ttl (int): DNS TTL
-      burst_enabled (bool): enable burst mode
-      burst_sleep (int): burst sleep ms
-      burst_jitter (int): burst jitter ms
-
-    GopherTCP:
-      host_bind (str): bind address
-      port_bind (int): bind port
-      callback_addresses (str): agent callback address
-      encrypt_key (str): 32 hex char encryption key (required)
-      ssl (bool): enable mTLS
-      tcp_banner (str): TCP banner string
-      error_answer (str): error response string
-      timeout (int): connection timeout seconds
-    """
     r = requests.post(
         f"https://{endpoint}/listener/create",
         headers=_api_headers(),
-        json={"name": name, "type": listener_type, "config": config},
+        json={"name": name, "type": canonical, "config": config_str},
         verify=False,
     )
     try:
         resp = r.json()
-        if resp.get("ok"):
-            return f"Listener '{name}' created successfully."
-        return f"Failed: {resp.get('message', 'unknown error')}"
     except Exception as e:
         return f"Error: {e}"
+    if not resp.get("ok"):
+        return _translate_backend_error(resp.get("message", "unknown error"), warnings)
+
+    lines = ["Listener '%s' created successfully." % name]
+    status_records, status_err = _fetch_listener_records()
+    if not status_err:
+        rec, _ = _find_listener_record(status_records, name)
+        if rec:
+            status = rec.get("l_status", "unknown")
+            if status and status != "Listen":
+                lines.append("Warning: listener status is '%s' (not listening); check teamserver.log and port conflicts." % status)
+            lines.append("listener=%s, type=%s, status=%s" % (name, canonical, status))
+    for warning in warnings:
+        lines.append("Note: %s" % warning)
+    return "\n".join(lines)
 
 
-@server.tool()
-def listener_edit(name: str, config: str):
-    """Edit a running listener's configuration.
-    name: listener name
-    config: JSON string with updated configuration"""
-    ltype = _get_listener_type(name)
-    if not ltype:
+@server.tool(description=_render_listener_help("edit"))
+def listener_edit(
+    name: str,
+    config: Union[str, Dict[str, Any]],
+    callback_from: str = "",
+):
+    """Edit a listener with patch semantics. Full field reference is generated from the schema registry."""
+    records, records_err = _fetch_listener_records()
+    if records_err:
+        return "Failed: %s" % records_err
+    rec, note = _find_listener_record(records, name)
+    if not rec:
         return f"Listener '{name}' not found."
+
+    ltype = rec.get("l_reg_name") or ""
+    warnings = [note] if note else []
+    base = _parse_listener_data(rec)
+    schema = LISTENER_SCHEMAS.get(ltype)
+
+    if schema is None:
+        config_str = config if isinstance(config, str) else json.dumps(config, ensure_ascii=False)
+        warnings.append("listener type '%s' is not in the schema registry; config is passed through unchanged" % ltype)
+    else:
+        data, cfg_warnings, errors, caller_keys = _normalize_listener_config(
+            ltype, config, callback_from=callback_from, merge_base=base,
+            lookup=_lookup_callback_from_teamserver, source="edit")
+        warnings.extend(cfg_warnings)
+        if errors:
+            return _format_config_errors(ltype, errors, warnings,
+                                         _minimal_example(ltype), records)
+        for key in sorted(caller_keys):
+            if key in schema["fields"] and key not in schema.get("editable", []):
+                warnings.append("field '%s' is not applied by a live edit; recreate or restart the listener" % key)
+        config_str = json.dumps(data, ensure_ascii=False)
+
     r = requests.post(
         f"https://{endpoint}/listener/edit",
         headers=_api_headers(),
-        json={"name": name, "type": ltype, "config": config},
+        json={"name": name, "type": ltype, "config": config_str},
         verify=False,
     )
     try:
         resp = r.json()
-        if resp.get("ok"):
-            return f"Listener '{name}' edited."
-        return f"Failed: {resp.get('message', 'unknown error')}"
     except Exception as e:
         return f"Error: {e}"
+    if not resp.get("ok"):
+        return _translate_backend_error(resp.get("message", "unknown error"), warnings)
+
+    lines = ["Listener '%s' edited." % name]
+    for warning in warnings:
+        lines.append("Note: %s" % warning)
+    return "\n".join(lines)
 
 
 @server.tool()

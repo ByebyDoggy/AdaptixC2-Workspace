@@ -51,12 +51,23 @@ Console output is captured per agent (`a_id`) with one lock per agent, so
 concurrent tool calls and background agent traffic can never be mixed into
 another command's result.
 
+## Config input tolerance
+
+`listener_create`, `listener_edit` and `agent_generate` accept `config` as a
+JSON object **or** a JSON string (double-encoded JSON is decoded too). Scalars
+are coerced to one-element lists where the backend expects `[]string`, a list is
+joined into the newline-separated string GopherTCP expects, and the legacy
+`callback_servers` alias is mapped to `callback_addresses`. Missing listener
+callbacks can be inherited with `callback_from="<running-listener>"`; otherwise
+the call fails with a field-level message and a copy-pasteable example.
+
 ## Tests
 
 ```bash
 python3 -m py_compile AdaptixC2_mcp.py
 python3 tests/test_inventory.py
-python3 tests/smoke_mcp.py            # needs a running teamserver + launcher
+python3 tests/test_config_normalization.py   # pure unit tests, no server
+python3 tests/smoke_mcp.py                   # needs a running teamserver + launcher
 ```
 
 ## Provenance

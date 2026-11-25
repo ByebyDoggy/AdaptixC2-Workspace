@@ -243,6 +243,9 @@ def on_message(ws, message):
             "internal_ip": cur_msg.get("a_internal_ip", ""),
             "external_ip": cur_msg.get("a_external_ip", ""),
             "elevated": cur_msg.get("a_elevated", False),
+            "sleep": cur_msg.get("a_sleep", 0) or 0,
+            "async": bool(cur_msg.get("a_async", False)),
+            "last_tick": cur_msg.get("a_last_tick") or time.time(),
         }
 
     if cur_msg["type"] == TYPE_AGENT_TICK:
@@ -464,25 +467,58 @@ def send_command_execute(agent_id: str, cmdline: str, args: dict):
 agent_commands = {}  # agent_name -> list of command groups
 
 
+def _agent_stale(info, now=None):
+    """Mirror the GUI health check: no tick longer than the allowed window."""
+    last = info.get("last_tick")
+    if not last:
+        return True
+    try:
+        sleep = int(info.get("sleep") or 0)
+    except (TypeError, ValueError):
+        sleep = 0
+    try:
+        base = int(os.environ.get("ADAPTIX_AGENT_STALE_SEC", "300"))
+    except ValueError:
+        base = 300
+    stale_after = max(base, sleep * 2 + 40)
+    return (now if now is not None else time.time()) - float(last) > stale_after
+
+
 @server.tool()
-def get_live_beacons():
-    """Return all live agent sessions (beacons and gophers) with their details."""
+def get_live_beacons(include_stale: bool = False):
+    """Return live agent sessions (beacons and gophers) with their details.
+    Agents whose last tick is older than max(300s, sleep*2+40s) are hidden by
+    default; pass include_stale=True to list them with a [STALE] marker."""
     if not live_agents:
         return "No live agents."
     os_map = {0: "unknown", 1: "Windows", 2: "Linux", 3: "macOS"}
     lines = []
+    hidden = 0
+    now = time.time()
     for aid, info in live_agents.items():
+        stale = _agent_stale(info, now)
+        if stale and not include_stale:
+            hidden += 1
+            continue
+        tag = " [STALE]" if stale else ""
         if len(info) <= 1:
-            lines.append(f"  {aid} (tick only, no details)")
+            lines.append("  %s (tick only, no details)%s" % (aid, tag))
             continue
         os_name = os_map.get(info.get("os", 0), "unknown")
         elevated = "*" if info.get("elevated") else ""
+        last_tick = info.get("last_tick")
+        seen = "?" if not last_tick else "%ds ago" % int(max(0, now - float(last_tick)))
         lines.append(
             f"  {aid} | {info.get('name','')} | {info.get('computer','')}"
             f"\\{info.get('username','')}{elevated} | {os_name} {info.get('arch','')}"
             f" | {info.get('process','')} ({info.get('pid','')})"
             f" | {info.get('internal_ip','')} | listener={info.get('listener','')}"
+            f" | last_tick={seen}{tag}"
         )
+    if not lines:
+        return "No live agents. (%d stale agent(s) hidden; use include_stale=True)" % hidden
+    if hidden:
+        lines.append("(%d stale agent(s) hidden; use include_stale=True to show them)" % hidden)
     return "\n".join(lines)
 
 

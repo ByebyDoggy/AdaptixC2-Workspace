@@ -178,6 +178,15 @@ def test_help_and_errors():
     check("error report has example", "Minimal working example" in fmt and '"host_bind"' in fmt)
 
 
+def test_staleness():
+    print("[agent staleness]")
+    now = 1_800_000_000
+    check("fresh agent alive", not m._agent_stale({"last_tick": now - 30, "sleep": 5}, now))
+    check("old tick stale", m._agent_stale({"last_tick": now - 600, "sleep": 5}, now))
+    check("missing tick stale", m._agent_stale({}, now))
+    check("sleep extends window", not m._agent_stale({"last_tick": now - 200, "sleep": 120}, now))
+
+
 def main():
     test_parsing()
     test_coercion()
@@ -186,6 +195,7 @@ def main():
     test_agent()
     test_listener_names()
     test_help_and_errors()
+    test_staleness()
     print()
     if FAILS:
         print("FAILED: %d" % len(FAILS))

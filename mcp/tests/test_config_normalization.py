@@ -187,6 +187,21 @@ def test_staleness():
     check("sleep extends window", not m._agent_stale({"last_tick": now - 200, "sleep": 120}, now))
 
 
+def test_guards():
+    print("[deployment guards]")
+    check("loopback v4", m._callback_is_loopback("127.0.0.1:9092"))
+    check("loopback list", m._callback_is_loopback(["127.0.0.1:19091"]))
+    check("loopback localhost", m._callback_is_loopback("localhost:8080"))
+    check("public wss not loopback", not m._callback_is_loopback("wss://tcp.sweeper.channel/ws?k=x"))
+    check("public host not loopback", not m._callback_is_loopback("1.2.3.4:443"))
+    check("empty is loopback", m._callback_is_loopback(""))
+
+    _, warnings, err, _ = m._normalize_agent_config("gopher", {"os": "linux", "arch": "amd64", "reconn_count": 0})
+    check("reconn_count=0 warned", not err and any("reconn_count=0" in w for w in warnings), str(warnings))
+    _, warnings, err, _ = m._normalize_agent_config("gopher", {"os": "linux", "arch": "amd64", "reconn_count": 5})
+    check("reconn_count=5 clean", not any("reconn_count=0" in w for w in warnings), str(warnings))
+
+
 def main():
     test_parsing()
     test_coercion()
@@ -196,6 +211,7 @@ def main():
     test_listener_names()
     test_help_and_errors()
     test_staleness()
+    test_guards()
     print()
     if FAILS:
         print("FAILED: %d" % len(FAILS))

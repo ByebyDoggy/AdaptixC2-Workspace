@@ -761,7 +761,8 @@ AGENT_SCHEMAS = {
             "chain_contract": {"type": "str", "desc": "chain contract address", "example": ""},
             "chain_poll_sec": {"type": "int", "desc": "chain poll interval seconds", "example": 60},
         },
-        "example": {"os": "linux", "arch": "amd64", "format": "Exe", "reconn_timeout": "30s"},
+        "example": {"os": "linux", "arch": "amd64", "format": "Exe",
+                    "reconn_timeout": "30s", "reconn_count": 5},
     },
 }
 
@@ -865,6 +866,29 @@ def _bare_listener_name(value):
 def _missing_callback_message(field, kind):
     return ("missing required field '%s': expected %s. Pass callback_from=\"<running-listener>\" "
             "to inherit it, or set it explicitly." % (field, _callback_shape(kind)))
+
+
+def _callback_is_loopback(value):
+    """True when every callback address is loopback/unroutable for remote agents."""
+    if isinstance(value, list):
+        items = [str(item) for item in value]
+    else:
+        items = re.split(r"[,\n]", str(value or ""))
+    items = [item.strip() for item in items if item and item.strip()]
+    if not items:
+        return True
+    for item in items:
+        host = item
+        if host.startswith("ws://") or host.startswith("wss://"):
+            host = re.sub(r"^wss?://", "", host)
+            host = host.split("/")[0].split("?")[0]
+        if host.startswith("["):
+            host = host.split("]")[0].lstrip("[")
+        else:
+            host = host.split(":")[0]
+        if host.lower() not in ("127.0.0.1", "localhost", "::1", "0.0.0.0", ""):
+            return False
+    return True
 
 
 def _resolve_field_key(schema, index, key):
@@ -1181,6 +1205,11 @@ def _normalize_agent_config(agent_type, config):
             errors.append("format 'Service Exe' requires svcname")
         if not mapped.get("sleep"):
             warnings.append("sleep was not specified; the payload will use the server default")
+    if agent_type == "gopher":
+        reconn = mapped.get("reconn_count")
+        if reconn is None or reconn == 0 or reconn == "0":
+            warnings.append("reconn_count=0 means the gopher payload makes zero connection attempts "
+                            "and exits immediately; set it to 5-10 for deployment.")
 
     for key, spec in schema["fields"].items():
         if not spec.get("required"):
@@ -1423,6 +1452,21 @@ def agent_generate(
         if compat_errors:
             return _format_config_errors("agent %s" % canonical, compat_errors, warnings,
                                          AGENT_SCHEMAS[canonical]["example"], records)
+        loopback = []
+        for listener_name in names:
+            rec, _ = _find_listener_record(records, listener_name)
+            if not rec:
+                continue
+            listener_data = _parse_listener_data(rec)
+            callback = (listener_data.get("callback_addresses")
+                        or listener_data.get("domain") or rec.get("l_agent_addr"))
+            if _callback_is_loopback(callback):
+                loopback.append(listener_name)
+        if loopback:
+            warnings.append("listener(s) %s use a loopback/unroutable callback; remote agents cannot "
+                            "connect. Fix with listener_edit(name=..., config={\"callback_addresses\": "
+                            "\"wss://<public-host>/ws?k=<wsbridge-token>\"}) before deploying."
+                            % ", ".join(loopback))
 
     data, cfg_warnings, errors, _ = _normalize_agent_config(canonical, config)
     warnings.extend(cfg_warnings)
